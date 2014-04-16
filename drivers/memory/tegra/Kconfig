@@ -1,0 +1,16 @@
+config TEGRA_MC
+	bool "NVIDIA Tegra Memory Controller support"
+	default y
+	depends on ARCH_TEGRA
+	help
+	  This driver supports the Memory Controller (MC) hardware found on
+	  NVIDIA Tegra SoCs.
+
+config TEGRA_IOMMU_SMMU
+	bool "NVIDIA Tegra SMMU support"
+	default y
+	depends on TEGRA_MC
+	select IOMMU_API
+	help
+	  This driver supports the IOMMU hardware (SMMU) found on NVIDIA Tegra
+	  SoCs (Tegra30 up to Tegra124).
