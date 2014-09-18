@@ -661,13 +661,20 @@ struct drm_set_client_cap {
 };
 
 #define DRM_CLOEXEC O_CLOEXEC
+#define DRM_SYNC_FD O_DSYNC
 struct drm_prime_handle {
 	__u32 handle;
 
 	/** Flags.. only applicable for handle->fd */
 	__u32 flags;
 
-	/** Returned dmabuf file descriptor */
+	/**
+	 * DRM_IOCTL_PRIME_FD_TO_HANDLE:
+	 *   in: dma-buf fd
+	 * DRM_IOCTL_PRIME_HANDLE_TO_FD:
+	 *   in: sync fence fd if DRM_SYNC_FD flag is passed
+	 *   out: dma-buf fd
+	 */
 	__s32 fd;
 };
 
