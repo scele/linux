@@ -246,13 +246,14 @@ void sync_pt_free(struct sync_pt *pt);
 
 /**
  * sync_fence_create() - creates a sync fence
- * @name:	name of fence to create
- * @pt:		sync_pt to add to the fence
+ * @name:	name of the sync fence to create
+ * @fences:	fences to add to the sync fence
+ * @num_fences:	the number of fences in the @fences array
  *
- * Creates a fence containg @pt.  Once this is called, the fence takes
- * ownership of @pt.
+ * Creates a sync fence from an array of drm fences. Takes refs to @fences.
  */
-struct sync_fence *sync_fence_create(const char *name, struct sync_pt *pt);
+struct sync_fence *sync_fence_create(const char *name,
+				     struct fence **fences, int num_fences);
 
 /*
  * API for sync_fence consumers

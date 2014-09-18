@@ -187,27 +187,32 @@ static void fence_check_cb_func(struct fence *f, struct fence_cb *cb)
 		wake_up_all(&fence->wq);
 }
 
-/* TODO: implement a create which takes more that one sync_pt */
-struct sync_fence *sync_fence_create(const char *name, struct sync_pt *pt)
+struct sync_fence *sync_fence_create(const char *name,
+				     struct fence **fences, int num_fences)
 {
-	struct sync_fence *fence;
+	struct sync_fence *sync_fence;
+	int size = offsetof(struct sync_fence, cbs[num_fences]);
+	int i;
 
-	fence = sync_fence_alloc(offsetof(struct sync_fence, cbs[1]), name);
-	if (fence == NULL)
+	sync_fence = sync_fence_alloc(size, name);
+	if (sync_fence == NULL)
 		return NULL;
 
-	fence->num_fences = 1;
-	atomic_set(&fence->status, 1);
+	sync_fence->num_fences = num_fences;
+	atomic_set(&sync_fence->status, 0);
 
-	fence->cbs[0].sync_pt = &pt->base;
-	fence->cbs[0].fence = fence;
-	if (fence_add_callback(&pt->base, &fence->cbs[0].cb,
-			       fence_check_cb_func))
-		atomic_dec(&fence->status);
+	for (i = 0; i < num_fences; i++) {
+		struct fence *f = fences[i];
+		struct sync_fence_cb *cb = &sync_fence->cbs[i];
 
-	sync_fence_debug_add(fence);
+		cb->sync_pt = fence_get(f);
+		cb->fence = sync_fence;
+		if (!fence_add_callback(f, &cb->cb, fence_check_cb_func))
+			atomic_inc(&sync_fence->status);
+	}
+	sync_fence_debug_add(sync_fence);
 
-	return fence;
+	return sync_fence;
 }
 EXPORT_SYMBOL(sync_fence_create);
 
