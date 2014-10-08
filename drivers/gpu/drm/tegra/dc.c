@@ -700,6 +700,7 @@ static int tegra_dc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 {
 	struct tegra_dc *dc = to_tegra_dc(crtc);
 	struct drm_device *drm = crtc->dev;
+	int ret;
 
 	if (dc->event)
 		return -EBUSY;
@@ -707,7 +708,9 @@ static int tegra_dc_page_flip(struct drm_crtc *crtc, struct drm_framebuffer *fb,
 	if (event) {
 		event->pipe = dc->pipe;
 		dc->event = event;
-		drm_vblank_get(drm, dc->pipe);
+		ret = drm_vblank_get(drm, dc->pipe);
+		if (ret < 0)
+			return ret;
 	}
 
 	tegra_dc_set_base(dc, 0, 0, fb);
