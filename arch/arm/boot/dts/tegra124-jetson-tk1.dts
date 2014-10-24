@@ -51,6 +51,7 @@
 	};
 
 	gpu@0,57000000 {
+		status = "okay";
 		/*
 		 * Node left disabled on purpose - the bootloader will enable
 		 * it after having set the VPR up
