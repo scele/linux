@@ -343,7 +343,11 @@ static struct dma_page *__ttm_dma_alloc_page(struct dma_pool *pool)
 					   &d_page->dma,
 					   pool->gfp_flags);
 	if (d_page->vaddr)
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
+		d_page->p = phys_to_page(d_page->dma);
+#else
 		d_page->p = virt_to_page(d_page->vaddr);
+#endif
 	else {
 		kfree(d_page);
 		d_page = NULL;
