@@ -188,6 +188,18 @@ static int host1x_reloc_copy_from_user(struct host1x_reloc *dest,
 	return 0;
 }
 
+void tegra_drm_fence_wait(struct host1x_job *job, struct fence *fence)
+{
+	if (fence->ops == tegra_drm_fence_ops)
+		/* the fence is backed by syncpt (id,value) pair, push a host1x command
+		 * that waits for it. */
+		host1x_push_syncpt_wait(job, fence->syncpt_id, fence->syncpt_value);
+	else
+		/* the fence may be a nouveau semaphore backed fence, or sw_sync fence,
+		 * or something else - hw synchronization not supported. */
+		cpu_wait(fence);
+}
+
 int tegra_drm_submit(struct tegra_drm_context *context,
 		     struct drm_tegra_submit *args, struct drm_device *drm,
 		     struct drm_file *file)
@@ -220,6 +232,21 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 	job->class = context->client->base.class;
 	job->serialize = true;
 
+	/* Wait for pre-fences. */
+	if (implicit sync) {
+		acquire_all_dmabufs_using_ww_mutex(this is horrible);
+		for (each dmabuf used in submit) {
+			if (dmabuf used as read-only)
+				for (each shared fence in dmabuf)
+					tegra_drm_fence_wait(job, fence);
+			else /* buffer used as read-write */
+				tegra_drm_fence_wait(job, dmabuf->excl_fence);
+		}
+	} else if (args->flags & DRM_TEGRA_SUBMIT_FENCE_WAIT) {
+		for (each fence in args.fence)
+			tegra_drm_fence_wait(job, fence);
+	}
+
 	while (num_cmdbufs) {
 		struct drm_tegra_cmdbuf cmdbuf;
 		struct host1x_bo *bo;
@@ -239,6 +266,10 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 		num_cmdbufs--;
 		cmdbufs++;
 	}
+
+	/* Kernel inserts one increment after the gathers, which will signal the
+	 * post-fence thet gets created below. */
+	host1x_push_syncpt_incr_cmd(job, get_channel_syncpt_id(context->channel));
 
 	/* copy and resolve relocations from submit */
 	while (num_relocs--) {
@@ -277,7 +308,20 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 	if (err)
 		goto fail_submit;
 
-	args->fence = job->syncpt_end;
+	struct fence *fence = tegra_drm_create_fence(job->syncpt_id, job->syncpt_end);
+	if (implicit sync) {
+		for (each dmabuf used in the submit) {
+			if (dmabuf used as read only)
+				add_shared_fence(dmabuf, fence);
+			else /* dmabuf used as read-write */
+				set_excl_fence(dmabuf, fence);
+		}
+		release_all_dmabufs_using_ww_mutex();
+	} else if (args->flags & DRM_TEGRA_SUBMIT_FENCE_EMIT) {
+		/* Return a fence FD to user space. */
+		args->fence = get_unused_fd_flags(O_CLOEXEC);
+		sync_fence_install(args->fence, fence);
+	}
 
 	host1x_job_put(job);
 	return 0;
