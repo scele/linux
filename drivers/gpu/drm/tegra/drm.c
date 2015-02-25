@@ -188,37 +188,55 @@ static int host1x_reloc_copy_from_user(struct host1x_reloc *dest,
 	return 0;
 }
 
+void tegra_drm_fence_wait(struct host1x_job *job, struct fence *fence)
+{
+	if (fence->ops == tegra_drm_fence_ops)
+		/* the fence is backed by syncpt (id,value) pair, push a host1x command
+		 * that waits for it. */
+		host1x_push_syncpt_wait(job, fence->syncpt_id, fence->syncpt_value);
+	else
+		/* the fence may be a nouveau semaphore backed fence, or sw_sync fence,
+		 * or something else - hw synchronization not supported. */
+		cpu_wait(fence);
+}
+
 int tegra_drm_submit(struct tegra_drm_context *context,
 		     struct drm_tegra_submit *args, struct drm_device *drm,
 		     struct drm_file *file)
 {
 	unsigned int num_cmdbufs = args->num_cmdbufs;
 	unsigned int num_relocs = args->num_relocs;
-	unsigned int num_waitchks = args->num_waitchks;
 	struct drm_tegra_cmdbuf __user *cmdbufs =
 		(void __user *)(uintptr_t)args->cmdbufs;
 	struct drm_tegra_reloc __user *relocs =
 		(void __user *)(uintptr_t)args->relocs;
-	struct drm_tegra_waitchk __user *waitchks =
-		(void __user *)(uintptr_t)args->waitchks;
-	struct drm_tegra_syncpt syncpt;
 	struct host1x_job *job;
 	int err;
 
-	/* We don't yet support other than one syncpt_incr struct per submit */
-	if (args->num_syncpts != 1)
-		return -EINVAL;
-
 	job = host1x_job_alloc(context->channel, args->num_cmdbufs,
-			       args->num_relocs, args->num_waitchks);
+			       args->num_relocs, 0);
 	if (!job)
 		return -ENOMEM;
 
 	job->num_relocs = args->num_relocs;
-	job->num_waitchk = args->num_waitchks;
 	job->client = (u32)args->context;
 	job->class = context->client->base.class;
 	job->serialize = true;
+
+	/* Wait for pre-fences. */
+	if (implicit sync) {
+		acquire_all_dmabufs_using_ww_mutex(this is horrible);
+		for (each dmabuf used in submit) {
+			if (dmabuf used as read-only)
+				for (each shared fence in dmabuf)
+					tegra_drm_fence_wait(job, fence);
+			else /* buffer used as read-write */
+				tegra_drm_fence_wait(dmabuf->excl_fence);
+		}
+	} else if (args->flags & DRM_TEGRA_SUBMIT_FENCE_WAIT) {
+		for (each fence in args.fence)
+			tegra_drm_fence_wait(channel, fence);
+	}
 
 	while (num_cmdbufs) {
 		struct drm_tegra_cmdbuf cmdbuf;
@@ -240,6 +258,10 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 		cmdbufs++;
 	}
 
+	/* Kernel inserts one increment after the gathers, which will signal the
+	 * post-fence thet gets created below. */
+	host1x_push_syncpt_incr_cmd(job, get_channel_syncpt_id(context->channel));
+
 	/* copy and resolve relocations from submit */
 	while (num_relocs--) {
 		err = host1x_reloc_copy_from_user(&job->relocarray[num_relocs],
@@ -249,21 +271,9 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 			goto fail;
 	}
 
-	if (copy_from_user(job->waitchk, waitchks,
-			   sizeof(*waitchks) * num_waitchks)) {
-		err = -EFAULT;
-		goto fail;
-	}
-
-	if (copy_from_user(&syncpt, (void __user *)(uintptr_t)args->syncpts,
-			   sizeof(syncpt))) {
-		err = -EFAULT;
-		goto fail;
-	}
-
 	job->is_addr_reg = context->client->ops->is_addr_reg;
-	job->syncpt_incrs = syncpt.incrs;
-	job->syncpt_id = syncpt.id;
+	job->syncpt_incrs = 1;
+	job->syncpt_id = get_channel_syncpt_id(context->channel);
 	job->timeout = 10000;
 
 	if (args->timeout && args->timeout < 10000)
@@ -277,7 +287,20 @@ int tegra_drm_submit(struct tegra_drm_context *context,
 	if (err)
 		goto fail_submit;
 
-	args->fence = job->syncpt_end;
+	struct fence *fence = tegra_drm_create_fence(job->syncpt_id, job->syncpt_end);
+	if (implicit sync) {
+		for (each dmabuf used in the submit) {
+			if (dmabuf used as read only)
+				add_shared_fence(dmabuf, fence);
+			else /* dmabuf used as read-write */
+				set_excl_fence(dmabuf, fence);
+		}
+		release_all_dmabufs_using_ww_mutex();
+	} else if (args->flags & DRM_TEGRA_SUBMIT_FENCE_EMIT) {
+		/* Return a fence FD to user space. */
+		args->fence = get_unused_fd_flags(O_CLOEXEC);
+		sync_fence_install(args->fence, fence);
+	}
 
 	host1x_job_put(job);
 	return 0;
@@ -342,50 +365,6 @@ static int tegra_gem_mmap(struct drm_device *drm, void *data,
 	return 0;
 }
 
-static int tegra_syncpt_read(struct drm_device *drm, void *data,
-			     struct drm_file *file)
-{
-	struct host1x *host = dev_get_drvdata(drm->dev->parent);
-	struct drm_tegra_syncpt_read *args = data;
-	struct host1x_syncpt *sp;
-
-	sp = host1x_syncpt_get(host, args->id);
-	if (!sp)
-		return -EINVAL;
-
-	args->value = host1x_syncpt_read_min(sp);
-	return 0;
-}
-
-static int tegra_syncpt_incr(struct drm_device *drm, void *data,
-			     struct drm_file *file)
-{
-	struct host1x *host1x = dev_get_drvdata(drm->dev->parent);
-	struct drm_tegra_syncpt_incr *args = data;
-	struct host1x_syncpt *sp;
-
-	sp = host1x_syncpt_get(host1x, args->id);
-	if (!sp)
-		return -EINVAL;
-
-	return host1x_syncpt_incr(sp);
-}
-
-static int tegra_syncpt_wait(struct drm_device *drm, void *data,
-			     struct drm_file *file)
-{
-	struct host1x *host1x = dev_get_drvdata(drm->dev->parent);
-	struct drm_tegra_syncpt_wait *args = data;
-	struct host1x_syncpt *sp;
-
-	sp = host1x_syncpt_get(host1x, args->id);
-	if (!sp)
-		return -EINVAL;
-
-	return host1x_syncpt_wait(sp, args->thresh, args->timeout,
-				  &args->value);
-}
-
 static int tegra_open_channel(struct drm_device *drm, void *data,
 			      struct drm_file *file)
 {
@@ -434,28 +413,6 @@ static int tegra_close_channel(struct drm_device *drm, void *data,
 	return 0;
 }
 
-static int tegra_get_syncpt(struct drm_device *drm, void *data,
-			    struct drm_file *file)
-{
-	struct tegra_drm_file *fpriv = file->driver_priv;
-	struct drm_tegra_get_syncpt *args = data;
-	struct tegra_drm_context *context;
-	struct host1x_syncpt *syncpt;
-
-	context = tegra_drm_get_context(args->context);
-
-	if (!tegra_drm_file_owns_context(fpriv, context))
-		return -ENODEV;
-
-	if (args->index >= context->client->base.num_syncpts)
-		return -EINVAL;
-
-	syncpt = context->client->base.syncpts[args->index];
-	args->id = host1x_syncpt_id(syncpt);
-
-	return 0;
-}
-
 static int tegra_submit(struct drm_device *drm, void *data,
 			struct drm_file *file)
 {
@@ -469,34 +426,6 @@ static int tegra_submit(struct drm_device *drm, void *data,
 		return -ENODEV;
 
 	return context->client->ops->submit(context, args, drm, file);
-}
-
-static int tegra_get_syncpt_base(struct drm_device *drm, void *data,
-				 struct drm_file *file)
-{
-	struct tegra_drm_file *fpriv = file->driver_priv;
-	struct drm_tegra_get_syncpt_base *args = data;
-	struct tegra_drm_context *context;
-	struct host1x_syncpt_base *base;
-	struct host1x_syncpt *syncpt;
-
-	context = tegra_drm_get_context(args->context);
-
-	if (!tegra_drm_file_owns_context(fpriv, context))
-		return -ENODEV;
-
-	if (args->syncpt >= context->client->base.num_syncpts)
-		return -EINVAL;
-
-	syncpt = context->client->base.syncpts[args->syncpt];
-
-	base = host1x_syncpt_get_base(syncpt);
-	if (!base)
-		return -ENXIO;
-
-	args->id = host1x_syncpt_base_id(base);
-
-	return 0;
 }
 
 static int tegra_gem_set_tiling(struct drm_device *drm, void *data,
@@ -644,14 +573,9 @@ static const struct drm_ioctl_desc tegra_drm_ioctls[] = {
 #ifdef CONFIG_DRM_TEGRA_STAGING
 	DRM_IOCTL_DEF_DRV(TEGRA_GEM_CREATE, tegra_gem_create, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_GEM_MMAP, tegra_gem_mmap, DRM_UNLOCKED),
-	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_READ, tegra_syncpt_read, DRM_UNLOCKED),
-	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_INCR, tegra_syncpt_incr, DRM_UNLOCKED),
-	DRM_IOCTL_DEF_DRV(TEGRA_SYNCPT_WAIT, tegra_syncpt_wait, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_OPEN_CHANNEL, tegra_open_channel, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_CLOSE_CHANNEL, tegra_close_channel, DRM_UNLOCKED),
-	DRM_IOCTL_DEF_DRV(TEGRA_GET_SYNCPT, tegra_get_syncpt, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_SUBMIT, tegra_submit, DRM_UNLOCKED),
-	DRM_IOCTL_DEF_DRV(TEGRA_GET_SYNCPT_BASE, tegra_get_syncpt_base, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_GEM_SET_TILING, tegra_gem_set_tiling, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_GEM_GET_TILING, tegra_gem_get_tiling, DRM_UNLOCKED),
 	DRM_IOCTL_DEF_DRV(TEGRA_GEM_SET_FLAGS, tegra_gem_set_flags, DRM_UNLOCKED),
